@@ -3,7 +3,13 @@ import time
 import os
 import csv
 import logging
+import re
 from datetime import datetime
+
+# New imports for validation
+import matplotlib.pyplot as plt
+from matplotlib.mathtext import MathTextParser
+
 from google import genai
 from google.api_core import exceptions
 from google.genai import types
@@ -11,7 +17,7 @@ from google.genai import types
 # 1. Configuration & Global Constants
 API_KEY = os.getenv("GEMINI_API_KEY")
 TARGET_DIR = pathlib.Path(r"C:\College Notes DATA_BASE")
-OUTPUT_DIR = TARGET_DIR / "Transcribed_Text"  # New dedicated output node
+OUTPUT_DIR = TARGET_DIR / "Transcribed_Text"
 FAILURE_LOG_PATH = TARGET_DIR / "conversion_failures.csv"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s: %(message)s')
@@ -22,7 +28,7 @@ if not API_KEY:
 
 client = genai.Client(api_key=API_KEY)
 
-# Ensure the output directory exists before processing begins
+# Ensure the output directory exists
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # --- CORE PROCESSING LOGIC ---
@@ -46,7 +52,7 @@ def process_document(pdf_path, output_path, thinking_budget=None):
         if myfile.state == "FAILED":
             raise ValueError("File failed server-side ingestion.")
 
-        # Pass 1: Standard Transcription (Low Temperature for stability)
+        # Pass 1: Standard Transcription
         config = types.GenerateContentConfig(
             temperature=0.1,
             thinking_config=types.ThinkingConfig(thinking_budget=thinking_budget) if thinking_budget else None,
@@ -55,7 +61,8 @@ def process_document(pdf_path, output_path, thinking_budget=None):
 
         instruction = (
             "SYSTEM: Academic Archivist. Transcribe the multi-page PDF to Markdown. "
-            "Use LaTeX for all math. Label pages clearly with '## Page X'. "
+            "Use LaTeX for all math. Enclose inline math in single $ and block math in $$. "
+            "Label pages clearly with '## Page X'. "
             "Maintain all original headers and bullet points. Literal transcription only."
         )
 
@@ -68,15 +75,13 @@ def process_document(pdf_path, output_path, thinking_budget=None):
         if not response.text:
             raise ValueError("Empty response during transcription.")
 
-        # Pass 2: The Audit Pass (Strict Determinism for Financial Notation)
+        # Pass 2: The Audit Pass (Strict Determinism for Math Syntax)
         audit_instruction = (
-            "TASK: Conduct a technical audit of the transcription, specifically validating "
-            "economic and financial notation. Ensure all mathematical expressions (e.g., "
-            "time-indexed variables like $P_t$, discount factors, summations, and matrix "
-            "algebra) are rendered in grammatically correct LaTeX. Verify that any "
-            "financial tables, balance sheets, or regression outputs utilize proper "
-            "Markdown table syntax. Correct any syntax errors or omissions by comparing "
-            "strictly against the source PDF. Return the final, corrected text in full."
+            "TASK: Conduct a technical audit of the transcription. "
+            "1. Check that all LaTeX equations are syntactically valid (balanced braces, valid commands). "
+            "2. Ensure inline math uses single $ and display math uses $$. "
+            "3. Correct any 'hallucinated' symbols that do not exist in standard LaTeX. "
+            "Return the final, corrected text in full."
         )
         
         verified_response = client.models.generate_content(
@@ -95,7 +100,6 @@ def process_document(pdf_path, output_path, thinking_budget=None):
         return True
 
     except Exception as e:
-        # We only log to the CSV if it's a non-retryable logical error
         if not isinstance(e, exceptions.ResourceExhausted):
             log_failure(pdf_path.name, "Processing", str(e))
         raise e
@@ -132,34 +136,74 @@ def generate_report():
     print(f"Current Efficiency: {rate:.2f}%")
     return failed_files
 
+# --- SYNTAX VALIDATION ENGINE ---
+
+class LaTeXValidator:
+    """
+    Uses Matplotlib's mathtext parser to strictly validate LaTeX strings.
+    If Matplotlib can't parse it, it's likely broken syntax.
+    """
+    def __init__(self):
+        # We use the 'path' backend which is lightweight for parsing checks
+        self.parser = MathTextParser('path')
+
+    def is_valid(self, latex_str):
+        try:
+            # Strip delimiters for the parser check
+            clean_str = latex_str.strip("$")
+            # Matplotlib requires a non-empty string to parse
+            if not clean_str.strip():
+                return True 
+            self.parser.parse(f"${clean_str}$")
+            return True
+        except ValueError:
+            return False
+        except Exception:
+            # Catch-all for other MPL rendering errors
+            return False
+
 def validate_and_quarantine(output_dir):
     """
-    Scans output text files for unbalanced LaTeX delimiters.
-    Moves defective files to a '_Review_Required' subdirectory to maintain
-    dataset integrity.
+    Scans output text files for invalid LaTeX syntax.
+    Moves defective files to a '_Review_Required' subdirectory.
     """
     review_dir = output_dir / "_Review_Required"
     flagged_count = 0
+    validator = LaTeXValidator()
     
-    # We iterate purely over the text artifacts
+    # Regex to capture content between $...$ or $$...$$
+    # This pattern handles standard inline and display math
+    latex_pattern = re.compile(r'(\$\$?)(.+?)(\1)', re.DOTALL)
+    
     txt_files = list(output_dir.glob("*.txt"))
     
-    print(f"\n--- LATEX SYNTAX AUDIT ---")
+    print(f"\n--- LATEX SYNTAX AUDIT (Powered by Matplotlib) ---")
     
     for txt_file in txt_files:
+        is_defective = False
         try:
             with open(txt_file, "r", encoding="utf-8") as f:
                 content = f.read()
                 
-            # The count of '$' must be even. 
+            # 1. Basic Delimiter Check
             if content.count("$") % 2 != 0:
-                # Create the quarantine folder strictly on demand
+                print(f"[!] SYNTAX ERROR: Uneven delimiters in {txt_file.name}")
+                is_defective = True
+            
+            # 2. Deep Syntax Check via Matplotlib
+            else:
+                matches = latex_pattern.findall(content)
+                for _, equation, _ in matches:
+                    if not validator.is_valid(equation):
+                        print(f"[!] RENDER FAIL: Invalid LaTeX in {txt_file.name}: {equation[:30]}...")
+                        is_defective = True
+                        break # One error is enough to quarantine
+
+            if is_defective:
                 review_dir.mkdir(parents=True, exist_ok=True)
-                
                 target_path = review_dir / txt_file.name
                 
-                # We move the file; the 'with' block has already closed it.
-                print(f"[!] QUARANTINE: {txt_file.name} has uneven LaTeX delimiters. Moving to review.")
+                # Move file
                 txt_file.rename(target_path)
                 flagged_count += 1
                 
@@ -167,7 +211,7 @@ def validate_and_quarantine(output_dir):
             logger.error(f"Validation failed for {txt_file.name}: {e}")
 
     if flagged_count == 0:
-        print("Integrity Check Passed: All documents are valid.")
+        print("Integrity Check Passed: All documents contain valid LaTeX.")
     else:
         print(f"Audit Complete: {flagged_count} files moved to {review_dir}")
 
@@ -183,17 +227,15 @@ if __name__ == "__main__":
     logger.info(f"Found {len(pdf_files)} documents pending transcription.")
 
     for pdf in pdf_files:
-        # Construct the new path: Output Folder + Original Name + .txt suffix
         output_txt = OUTPUT_DIR / pdf.with_suffix(".txt").name
         
-        # Exponential Backoff Retry Loop for each file
         attempts = 0
         max_attempts = 3
         while attempts < max_attempts:
             try:
                 process_document(pdf, output_txt)
                 logger.info(f"Success: {pdf.name} -> {output_txt}")
-                time.sleep(2) # Base throttle
+                time.sleep(2) 
                 break
             except exceptions.ResourceExhausted:
                 wait = (2 ** attempts) * 60 
@@ -207,5 +249,5 @@ if __name__ == "__main__":
     # Final Audit
     failures = generate_report()
     
-    # New: Syntax Integrity & Quarantine
+    # Syntax Integrity & Quarantine
     validate_and_quarantine(OUTPUT_DIR)
