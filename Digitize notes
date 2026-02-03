@@ -1,0 +1,211 @@
+import pathlib
+import time
+import os
+import csv
+import logging
+from datetime import datetime
+from google import genai
+from google.api_core import exceptions
+from google.genai import types
+
+# 1. Configuration & Global Constants
+API_KEY = os.getenv("GEMINI_API_KEY")
+TARGET_DIR = pathlib.Path(r"C:\College Notes DATA_BASE")
+OUTPUT_DIR = TARGET_DIR / "Transcribed_Text"  # New dedicated output node
+FAILURE_LOG_PATH = TARGET_DIR / "conversion_failures.csv"
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
+
+if not API_KEY:
+    raise EnvironmentError("GEMINI_API_KEY environment variable is not configured.")
+
+client = genai.Client(api_key=API_KEY)
+
+# Ensure the output directory exists before processing begins
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# --- CORE PROCESSING LOGIC ---
+
+def process_document(pdf_path, output_path, thinking_budget=None):
+    """
+    Orchestrates high-fidelity transcription using a two-pass verification system.
+    """
+    myfile = None
+    try:
+        myfile = client.files.upload(file=pdf_path)
+
+        # Await server-side processing
+        start = time.time()
+        while myfile.state == "PROCESSING":
+            if time.time() - start > 300:
+                raise TimeoutError("Server ingestion timeout.")
+            time.sleep(5)
+            myfile = client.files.get(name=myfile.name)
+
+        if myfile.state == "FAILED":
+            raise ValueError("File failed server-side ingestion.")
+
+        # Pass 1: Standard Transcription (Low Temperature for stability)
+        config = types.GenerateContentConfig(
+            temperature=0.1,
+            thinking_config=types.ThinkingConfig(thinking_budget=thinking_budget) if thinking_budget else None,
+            max_output_tokens=8192
+        )
+
+        instruction = (
+            "SYSTEM: Academic Archivist. Transcribe the multi-page PDF to Markdown. "
+            "Use LaTeX for all math. Label pages clearly with '## Page X'. "
+            "Maintain all original headers and bullet points. Literal transcription only."
+        )
+
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[myfile, instruction],
+            config=config
+        )
+
+        if not response.text:
+            raise ValueError("Empty response during transcription.")
+
+        # Pass 2: The Audit Pass (Strict Determinism for Financial Notation)
+        audit_instruction = (
+            "TASK: Conduct a technical audit of the transcription, specifically validating "
+            "economic and financial notation. Ensure all mathematical expressions (e.g., "
+            "time-indexed variables like $P_t$, discount factors, summations, and matrix "
+            "algebra) are rendered in grammatically correct LaTeX. Verify that any "
+            "financial tables, balance sheets, or regression outputs utilize proper "
+            "Markdown table syntax. Correct any syntax errors or omissions by comparing "
+            "strictly against the source PDF. Return the final, corrected text in full."
+        )
+        
+        verified_response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[myfile, f"DRAFT:\n{response.text}", audit_instruction],
+            config=types.GenerateContentConfig(temperature=0.0)
+        )
+
+        final_text = verified_response.text if verified_response.text else response.text
+
+        # Atomic File Write
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(final_text)
+
+        return True
+
+    except Exception as e:
+        # We only log to the CSV if it's a non-retryable logical error
+        if not isinstance(e, exceptions.ResourceExhausted):
+            log_failure(pdf_path.name, "Processing", str(e))
+        raise e
+    finally:
+        if myfile:
+            try: client.files.delete(name=myfile.name)
+            except: pass
+
+# --- LOGGING & AUDIT TOOLS ---
+
+def log_failure(filename, stage, error_msg):
+    file_exists = FAILURE_LOG_PATH.exists()
+    with open(FAILURE_LOG_PATH, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["timestamp", "file", "stage", "error"])
+        if not file_exists: writer.writeheader()
+        writer.writerow({
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "file": filename, "stage": stage, "error": error_msg
+        })
+
+def generate_report():
+    all_pdfs = list(TARGET_DIR.glob("*.pdf"))
+    failed_files = set()
+    if FAILURE_LOG_PATH.exists():
+        with open(FAILURE_LOG_PATH, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            failed_files = {row['file'] for row in reader}
+
+    success_count = len(all_pdfs) - len(failed_files)
+    rate = (success_count / len(all_pdfs)) * 100 if all_pdfs else 0
+    
+    print(f"\n--- ACADEMIC BATCH AUDIT ---")
+    print(f"Total PDFs: {len(all_pdfs)} | Success: {success_count} | Failures: {len(failed_files)}")
+    print(f"Current Efficiency: {rate:.2f}%")
+    return failed_files
+
+def validate_and_quarantine(output_dir):
+    """
+    Scans output text files for unbalanced LaTeX delimiters.
+    Moves defective files to a '_Review_Required' subdirectory to maintain
+    dataset integrity.
+    """
+    review_dir = output_dir / "_Review_Required"
+    flagged_count = 0
+    
+    # We iterate purely over the text artifacts
+    txt_files = list(output_dir.glob("*.txt"))
+    
+    print(f"\n--- LATEX SYNTAX AUDIT ---")
+    
+    for txt_file in txt_files:
+        try:
+            with open(txt_file, "r", encoding="utf-8") as f:
+                content = f.read()
+                
+            # The count of '$' must be even. 
+            if content.count("$") % 2 != 0:
+                # Create the quarantine folder strictly on demand
+                review_dir.mkdir(parents=True, exist_ok=True)
+                
+                target_path = review_dir / txt_file.name
+                
+                # We move the file; the 'with' block has already closed it.
+                print(f"[!] QUARANTINE: {txt_file.name} has uneven LaTeX delimiters. Moving to review.")
+                txt_file.rename(target_path)
+                flagged_count += 1
+                
+        except Exception as e:
+            logger.error(f"Validation failed for {txt_file.name}: {e}")
+
+    if flagged_count == 0:
+        print("Integrity Check Passed: All documents are valid.")
+    else:
+        print(f"Audit Complete: {flagged_count} files moved to {review_dir}")
+
+# --- MAIN EXECUTION ---
+
+if __name__ == "__main__":
+    # Filter: Select PDFs only if their corresponding .txt does NOT exist in the OUTPUT_DIR
+    pdf_files = [
+        f for f in TARGET_DIR.glob("*.pdf") 
+        if not (OUTPUT_DIR / f.with_suffix(".txt").name).exists()
+    ]
+    
+    logger.info(f"Found {len(pdf_files)} documents pending transcription.")
+
+    for pdf in pdf_files:
+        # Construct the new path: Output Folder + Original Name + .txt suffix
+        output_txt = OUTPUT_DIR / pdf.with_suffix(".txt").name
+        
+        # Exponential Backoff Retry Loop for each file
+        attempts = 0
+        max_attempts = 3
+        while attempts < max_attempts:
+            try:
+                process_document(pdf, output_txt)
+                logger.info(f"Success: {pdf.name} -> {output_txt}")
+                time.sleep(2) # Base throttle
+                break
+            except exceptions.ResourceExhausted:
+                wait = (2 ** attempts) * 60 
+                logger.warning(f"Rate limited on {pdf.name}. Sleeping {wait}s...")
+                time.sleep(wait)
+                attempts += 1
+            except Exception as e:
+                logger.error(f"Critical fail on {pdf.name}: {e}")
+                break
+
+    # Final Audit
+    failures = generate_report()
+    
+    # New: Syntax Integrity & Quarantine
+    validate_and_quarantine(OUTPUT_DIR)
