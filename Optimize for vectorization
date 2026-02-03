@@ -1,0 +1,173 @@
+import pathlib
+import os
+import time
+import json
+import logging
+import random
+import re
+from google import genai
+from google.genai import types
+from google.api_core import exceptions
+
+# 1. Configuration
+API_KEY = os.getenv("GEMINI_API_KEY")
+SOURCE_DIR = pathlib.Path(r"C:\College Notes DATA_BASE\Transcribed_Text")
+TARGET_DIR = pathlib.Path(r"C:\College Notes DATA_BASE\RAG_Staging")
+
+# Configure Logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
+logger = logging.getLogger(__name__)
+
+if not API_KEY:
+    raise EnvironmentError("GEMINI_API_KEY is missing.")
+
+client = genai.Client(api_key=API_KEY)
+
+# Ensure target directory exists
+TARGET_DIR.mkdir(parents=True, exist_ok=True)
+
+# --- SCHEMAS ---
+# We only use JSON for the metadata now. The text handles itself.
+METADATA_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "title": {"type": "STRING"},
+        "summary": {"type": "STRING"},
+        "keywords": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "domain": {"type": "STRING"},
+        "complexity": {"type": "STRING", "enum": ["Introductory", "Intermediate", "Advanced", "PhD Level"]},
+        "confidence_score": {"type": "NUMBER", "description": "Float between 0.0 and 1.0 indicating data integrity."}
+    },
+    "required": ["title", "summary", "keywords", "domain", "complexity"]
+}
+
+# --- CORE LOGIC ---
+
+def generate_with_backoff(model, contents, config, max_retries=5):
+    delay = 2
+    for attempt in range(max_retries):
+        try:
+            return client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=config
+            )
+        except exceptions.ResourceExhausted:
+            wait_time = delay + random.uniform(0, 1)
+            logger.warning(f"Rate limited. Retrying in {wait_time:.2f}s (Attempt {attempt + 1}/{max_retries})")
+            time.sleep(wait_time)
+            delay *= 2
+        except exceptions.InternalServerError:
+            logger.warning(f"Server error. Retrying in 5s...")
+            time.sleep(5)
+        except Exception as e:
+            raise e
+    raise TimeoutError("Max retries exceeded for Gemini API.")
+
+def optimize_file(txt_path):
+    """
+    Two-Pass Approach:
+    1. Clean the text (Raw Output).
+    2. Generate Metadata (JSON Output).
+    """
+    try:
+        # --- FIXED INDENTATION HERE ---
+        with open(txt_path, "r", encoding="utf-8") as f:
+            raw_content = f.read()
+
+        if len(raw_content) < 50:
+            logger.warning(f"Skipping {txt_path.name}: Content insufficient.")
+            return
+
+        # --- PASS 1: TEXT CLEANING ---
+        clean_instruction = (
+            "SYSTEM: You are a Senior Academic Editor. \n"
+            "Task: Rewrite the following raw notes into clean, structured Markdown.\n"
+            "Rules:\n"
+            "1. Use H1 (#) for main titles, H2 (##) for concepts.\n"
+            "2. Fix broken sentences caused by page breaks.\n"
+            "3. Use LaTeX ($...$) for math.\n"
+            "4. Remove artifacts like 'Page 1', dates, or headers.\n"
+            "5. OUTPUT ONLY THE CLEANED TEXT. NO PREAMBLE."
+        )
+
+        # Config: Plain Text (No JSON constraints for the heavy content)
+        text_config = types.GenerateContentConfig(
+            response_mime_type="text/plain", 
+            temperature=0.0
+        )
+
+        text_response = generate_with_backoff(
+            model="gemini-2.5-flash",
+            contents=[f"RAW NOTES:\n{raw_content}", clean_instruction],
+            config=text_config
+        )
+        
+        if not text_response.text:
+            logger.error(f"Failed Pass 1: Empty text response for {txt_path.name}")
+            return
+
+        cleaned_markdown = text_response.text.strip()
+
+        # --- PASS 2: METADATA EXTRACTION ---
+        meta_instruction = (
+            "SYSTEM: Analyze the following academic text and generate metadata JSON.\n"
+            "Strictly follow the schema."
+        )
+
+        meta_config = types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=METADATA_SCHEMA,
+            temperature=0.0
+        )
+
+        meta_response = generate_with_backoff(
+            model="gemini-2.5-flash",
+            contents=[f"TEXT:\n{cleaned_markdown[:10000]}", meta_instruction], 
+            config=meta_config
+        )
+
+        # Handle Metadata JSON
+        try:
+            # Simple cleaning in case it wraps code blocks
+            meta_text = meta_response.text.strip()
+            if meta_text.startswith("```"):
+                meta_text = re.sub(r"^```json\s*|^```\s*", "", meta_text)
+                meta_text = re.sub(r"\s*```$", "", meta_text)
+            
+            metadata = json.loads(meta_text)
+        except json.JSONDecodeError:
+            logger.warning(f"Metadata generation failed for {txt_path.name}. Using default.")
+            metadata = {"title": txt_path.stem, "error": "Metadata generation failed"}
+
+        # --- SAVE OUTPUTS ---
+        
+        # 1. Save Markdown
+        txt_output = TARGET_DIR / txt_path.name
+        with open(txt_output, "w", encoding="utf-8") as f:
+            f.write(cleaned_markdown)
+
+        # 2. Save Metadata
+        json_output = TARGET_DIR / txt_path.with_suffix(".json").name
+        with open(json_output, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=4)
+
+        logger.info(f"Success: {txt_path.name}")
+
+    except Exception as e:
+        logger.error(f"System Error on {txt_path.name}: {e}")
+
+# --- EXECUTION ---
+if __name__ == "__main__":
+    pending_files = [
+        f for f in SOURCE_DIR.glob("*.txt") 
+        if not (TARGET_DIR / f.name).exists()
+    ]
+    
+    logger.info(f"Pipeline initialized. {len(pending_files)} files in queue.")
+
+    for txt_file in pending_files:
+        optimize_file(txt_file)
+        time.sleep(1) # Slight pause between files
+            
+    print(f"\n--- RAG Optimization Complete ---\nOutput Location: {TARGET_DIR}")
