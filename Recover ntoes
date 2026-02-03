@@ -1,0 +1,183 @@
+import pathlib
+import os
+import time
+import csv
+import logging
+import re
+from datetime import datetime
+
+# Matplotlib for strict syntax auditing
+import matplotlib.pyplot as plt
+from matplotlib.mathtext import MathTextParser
+
+from google import genai
+from google.genai import types
+
+# 1. Configuration
+API_KEY = os.getenv("GEMINI_API_KEY")
+TARGET_DIR = pathlib.Path(r"C:\College Notes DATA_BASE")
+OUTPUT_DIR = TARGET_DIR / "Transcribed_Text"
+QUARANTINE_DIR = OUTPUT_DIR / "_Review_Required"
+RECOVERY_LOG_PATH = TARGET_DIR / "recovery_audit.csv"
+
+# Configure Logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
+
+if not API_KEY:
+    raise EnvironmentError("GEMINI_API_KEY is missing.")
+
+client = genai.Client(api_key=API_KEY)
+
+# --- STRICT VALIDATION ENGINE ---
+
+class LaTeXValidator:
+    def __init__(self):
+        self.parser = MathTextParser('path')
+
+    def check_text_validity(self, text_content):
+        """
+        Returns (True, "Valid") if math renders correctly.
+        Returns (False, Error_Message) if it fails.
+        """
+        # 1. Heuristic: Balanced Delimiters
+        if text_content.count("$") % 2 != 0:
+            return False, "Uneven LaTeX delimiters ($)"
+
+        # 2. Deep Parsing: Matplotlib
+        latex_pattern = re.compile(r'(\$\$?)(.+?)(\1)', re.DOTALL)
+        matches = latex_pattern.findall(text_content)
+
+        for _, equation, _ in matches:
+            try:
+                # Cleaning: Remove newlines which Matplotlib hates in inline math
+                clean_eq = equation.strip().replace('\n', ' ')
+                if not clean_eq: continue
+                
+                # Render Test
+                self.parser.parse(f"${clean_eq}$")
+            except ValueError:
+                return False, f"Syntax Error: {clean_eq[:20]}..."
+            except Exception as e:
+                return False, f"Render Error: {str(e)}"
+        
+        return True, "Valid"
+
+# --- AUDIT LOGGING ---
+
+def log_remediation(filename, method, status, notes=""):
+    file_exists = RECOVERY_LOG_PATH.exists()
+    try:
+        with open(RECOVERY_LOG_PATH, "a", newline="", encoding="utf-8") as f:
+            fields = ["timestamp", "file", "method", "status", "details"]
+            writer = csv.DictWriter(f, fieldnames=fields)
+            if not file_exists: writer.writeheader()
+            writer.writerow({
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "file": filename, "method": method, "status": status, "details": notes
+            })
+    except Exception as e:
+        logger.error(f"Failed to write to audit log: {e}")
+
+# --- RECOVERY LOGIC ---
+
+def recover_quarantined_files():
+    quarantined_files = list(QUARANTINE_DIR.glob("*.txt"))
+    validator = LaTeXValidator()
+    
+    if not quarantined_files:
+        logger.info("No files found in quarantine. System clean.")
+        return
+
+    logger.info(f"Starting progressive recovery for {len(quarantined_files)} files...")
+
+    for txt_file in quarantined_files:
+        try:
+            pdf_name = txt_file.with_suffix(".pdf").name
+            pdf_path = TARGET_DIR / pdf_name
+            
+            if not pdf_path.exists():
+                logger.error(f"Source PDF missing for {txt_file.name}. Skipping.")
+                continue
+
+            with open(txt_file, "r", encoding="utf-8") as f:
+                current_text = f.read()
+
+            # 1. Pre-Check: If you manually fixed it, move it immediately.
+            is_valid, msg = validator.check_text_validity(current_text)
+            if is_valid:
+                logger.info(f"Manual fix verified for {txt_file.name}. Promoting...")
+                promote_file(txt_file)
+                continue
+
+            # 2. AI Remediation (Grammar + Syntax)
+            logger.info(f"Applying AI edits to {txt_file.name}...")
+            refined_text = run_remediation_audit(pdf_path, current_text)
+
+            # --- CRITICAL CHANGE: PROGRESSIVE SAVING ---
+            # We overwrite the quarantine file with the NEW text immediately.
+            # This ensures grammar fixes are saved even if math validation fails later.
+            with open(txt_file, "w", encoding="utf-8") as f:
+                f.write(refined_text)
+
+            # 3. Post-Audit Validation
+            is_valid_ai, msg_ai = validator.check_text_validity(refined_text)
+            
+            if is_valid_ai:
+                # If perfect, move to success folder
+                logger.info(f"SUCCESS: {txt_file.name} is now valid. Promoting.")
+                log_remediation(txt_file.name, "AI Repair", "Promoted", "All checks passed")
+                promote_file(txt_file)
+            else:
+                # If imperfect, leave it in quarantine (but now it has better grammar)
+                logger.warning(f"PARTIAL SUCCESS: {txt_file.name} updated with grammar fixes, but math failed: {msg_ai}")
+                log_remediation(txt_file.name, "AI Repair", "Updated (Still Quarantined)", f"Saved grammar fixes. Math error: {msg_ai}")
+
+        except Exception as e:
+            logger.error(f"Error processing {txt_file.name}: {e}")
+
+def run_remediation_audit(pdf_path, draft_text):
+    """
+    Revised Prompt: Explicitly handles the Table/Math confusion found in your logs.
+    """
+    myfile = None
+    try:
+        myfile = client.files.upload(file=pdf_path)
+        
+        while myfile.state == "PROCESSING":
+            time.sleep(2)
+            myfile = client.files.get(name=myfile.name)
+            
+        audit_instruction = (
+            "SYSTEM: Senior Academic Editor.\n"
+            "TASK: Refine the Draft Text based on the Source PDF.\n\n"
+            "1. LINGUISTIC REPAIR (PRIORITY): Fix all sentence fragments, grammatical errors, and awkward phrasing. "
+            "Use context to make the text flow like a formal essay.\n"
+            "2. MATH SYNTAX: Ensure all equations use LaTeX ($...$). "
+            "CRITICAL: Do NOT wrap Markdown tables (lines with |) in LaTeX delimiters ($). This causes syntax errors.\n"
+            "3. DELIMITERS: Ensure every opening $ has a closing $.\n\n"
+            "Return the FULL corrected text."
+        )
+
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[myfile, f"DRAFT:\n{draft_text}", audit_instruction],
+            config=types.GenerateContentConfig(temperature=0.1) 
+        )
+        
+        return response.text if response.text else draft_text
+
+    finally:
+        if myfile:
+            try: client.files.delete(name=myfile.name)
+            except: pass
+
+def promote_file(txt_file):
+    destination = OUTPUT_DIR / txt_file.name
+    try:
+        if destination.exists(): os.remove(destination)
+        txt_file.rename(destination)
+    except Exception as e:
+        logger.error(f"Failed to move {txt_file.name}: {e}")
+
+if __name__ == "__main__":
