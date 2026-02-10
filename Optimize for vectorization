@@ -1,173 +1,184 @@
 import pathlib
-import os
-import time
 import json
-import logging
-import random
 import re
-from google import genai
-from google.genai import types
-from google.api_core import exceptions
+import logging
+import uuid
+from datetime import datetime
+from typing import List, Dict, Any
 
-# 1. Configuration
-API_KEY = os.getenv("GEMINI_API_KEY")
-SOURCE_DIR = pathlib.Path(r"C:\College Notes DATA_BASE\Transcribed_Text")
-TARGET_DIR = pathlib.Path(r"C:\College Notes DATA_BASE\RAG_Staging")
+# --- 1. CONFIGURATION ---
 
-# Configure Logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
-logger = logging.getLogger(__name__)
-
-if not API_KEY:
-    raise EnvironmentError("GEMINI_API_KEY is missing.")
-
-client = genai.Client(api_key=API_KEY)
-
-# Ensure target directory exists
-TARGET_DIR.mkdir(parents=True, exist_ok=True)
-
-# --- SCHEMAS ---
-# We only use JSON for the metadata now. The text handles itself.
-METADATA_SCHEMA = {
-    "type": "OBJECT",
-    "properties": {
-        "title": {"type": "STRING"},
-        "summary": {"type": "STRING"},
-        "keywords": {"type": "ARRAY", "items": {"type": "STRING"}},
-        "domain": {"type": "STRING"},
-        "complexity": {"type": "STRING", "enum": ["Introductory", "Intermediate", "Advanced", "PhD Level"]},
-        "confidence_score": {"type": "NUMBER", "description": "Float between 0.0 and 1.0 indicating data integrity."}
-    },
-    "required": ["title", "summary", "keywords", "domain", "complexity"]
-}
-
-# --- CORE LOGIC ---
-
-def generate_with_backoff(model, contents, config, max_retries=5):
-    delay = 2
-    for attempt in range(max_retries):
-        try:
-            return client.models.generate_content(
-                model=model,
-                contents=contents,
-                config=config
-            )
-        except exceptions.ResourceExhausted:
-            wait_time = delay + random.uniform(0, 1)
-            logger.warning(f"Rate limited. Retrying in {wait_time:.2f}s (Attempt {attempt + 1}/{max_retries})")
-            time.sleep(wait_time)
-            delay *= 2
-        except exceptions.InternalServerError:
-            logger.warning(f"Server error. Retrying in 5s...")
-            time.sleep(5)
-        except Exception as e:
-            raise e
-    raise TimeoutError("Max retries exceeded for Gemini API.")
-
-def optimize_file(txt_path):
-    """
-    Two-Pass Approach:
-    1. Clean the text (Raw Output).
-    2. Generate Metadata (JSON Output).
-    """
-    try:
-        # --- FIXED INDENTATION HERE ---
-        with open(txt_path, "r", encoding="utf-8") as f:
-            raw_content = f.read()
-
-        if len(raw_content) < 50:
-            logger.warning(f"Skipping {txt_path.name}: Content insufficient.")
-            return
-
-        # --- PASS 1: TEXT CLEANING ---
-        clean_instruction = (
-            "SYSTEM: You are a Senior Academic Editor. \n"
-            "Task: Rewrite the following raw notes into clean, structured Markdown.\n"
-            "Rules:\n"
-            "1. Use H1 (#) for main titles, H2 (##) for concepts.\n"
-            "2. Fix broken sentences caused by page breaks.\n"
-            "3. Use LaTeX ($...$) for math.\n"
-            "4. Remove artifacts like 'Page 1', dates, or headers.\n"
-            "5. OUTPUT ONLY THE CLEANED TEXT. NO PREAMBLE."
-        )
-
-        # Config: Plain Text (No JSON constraints for the heavy content)
-        text_config = types.GenerateContentConfig(
-            response_mime_type="text/plain", 
-            temperature=0.0
-        )
-
-        text_response = generate_with_backoff(
-            model="gemini-2.5-flash",
-            contents=[f"RAW NOTES:\n{raw_content}", clean_instruction],
-            config=text_config
-        )
-        
-        if not text_response.text:
-            logger.error(f"Failed Pass 1: Empty text response for {txt_path.name}")
-            return
-
-        cleaned_markdown = text_response.text.strip()
-
-        # --- PASS 2: METADATA EXTRACTION ---
-        meta_instruction = (
-            "SYSTEM: Analyze the following academic text and generate metadata JSON.\n"
-            "Strictly follow the schema."
-        )
-
-        meta_config = types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=METADATA_SCHEMA,
-            temperature=0.0
-        )
-
-        meta_response = generate_with_backoff(
-            model="gemini-2.5-flash",
-            contents=[f"TEXT:\n{cleaned_markdown[:10000]}", meta_instruction], 
-            config=meta_config
-        )
-
-        # Handle Metadata JSON
-        try:
-            # Simple cleaning in case it wraps code blocks
-            meta_text = meta_response.text.strip()
-            if meta_text.startswith("```"):
-                meta_text = re.sub(r"^```json\s*|^```\s*", "", meta_text)
-                meta_text = re.sub(r"\s*```$", "", meta_text)
-            
-            metadata = json.loads(meta_text)
-        except json.JSONDecodeError:
-            logger.warning(f"Metadata generation failed for {txt_path.name}. Using default.")
-            metadata = {"title": txt_path.stem, "error": "Metadata generation failed"}
-
-        # --- SAVE OUTPUTS ---
-        
-        # 1. Save Markdown
-        txt_output = TARGET_DIR / txt_path.name
-        with open(txt_output, "w", encoding="utf-8") as f:
-            f.write(cleaned_markdown)
-
-        # 2. Save Metadata
-        json_output = TARGET_DIR / txt_path.with_suffix(".json").name
-        with open(json_output, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, indent=4)
-
-        logger.info(f"Success: {txt_path.name}")
-
-    except Exception as e:
-        logger.error(f"System Error on {txt_path.name}: {e}")
-
-# --- EXECUTION ---
-if __name__ == "__main__":
-    pending_files = [
-        f for f in SOURCE_DIR.glob("*.txt") 
-        if not (TARGET_DIR / f.name).exists()
-    ]
+class ChunkingConfig:
+    # Paths
+    BASE_DIR = pathlib.Path(r"C:\College Notes DATA_BASE")
+    INPUT_DIR = BASE_DIR / "Transcribed_Text"
+    OUTPUT_FILE = BASE_DIR / "knowledge_base.json"
     
-    logger.info(f"Pipeline initialized. {len(pending_files)} files in queue.")
+    # Tuning Parameters
+    MIN_CHUNK_LENGTH = 50   # Discard chunks with fewer than 50 characters (noise)
+    MAX_CHUNK_LENGTH = 1500 # Soft limit for chunk size (approx 300-400 tokens)
 
-    for txt_file in pending_files:
-        optimize_file(txt_file)
-        time.sleep(1) # Slight pause between files
-            
-    print(f"\n--- RAG Optimization Complete ---\nOutput Location: {TARGET_DIR}")
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - [%(levelname)s] - %(message)s',
+    datefmt='%H:%M:%S'
+)
+logger = logging.getLogger("SemanticChunker")
+
+# --- 2. THE CHUNKING ENGINE ---
+
+class NoteParser:
+    """
+    A state-machine parser that reads text line-by-line to build 
+    semantically coherent chunks based on Markdown headers.
+    """
+    def __init__(self):
+        # Regex to detect headers (e.g., "# Topic" or "## Subtopic")
+        self.header_pattern = re.compile(r'^(#{1,3})\s+(.+)$')
+        # Regex to detect page markers (e.g., "## Page 5")
+        self.page_pattern = re.compile(r'^##\s+Page\s+(\d+)$', re.IGNORECASE)
+        # Regex for cleaning multiple spaces
+        self.whitespace_pattern = re.compile(r'\s+')
+
+    def parse_file(self, file_path: pathlib.Path) -> List[Dict[str, Any]]:
+        """
+        Parses a single text file into a list of chunk objects.
+        """
+        chunks = []
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+        except Exception as e:
+            logger.error(f"Could not read {file_path.name}: {e}")
+            return []
+
+        # State Variables
+        current_chunk_text = []
+        current_header = "Introduction" # Default header if none exists at top
+        current_page = 1
+        
+        source_pdf = file_path.stem + ".pdf"
+
+        for line in lines:
+            stripped_line = line.strip()
+            if not stripped_line:
+                continue
+
+            # Check 1: Is this a Page Marker?
+            page_match = self.page_pattern.match(stripped_line)
+            if page_match:
+                # Update state, but do NOT add to text (keeps flow continuous)
+                current_page = int(page_match.group(1))
+                continue
+
+            # Check 2: Is this a Topic Header?
+            header_match = self.header_pattern.match(stripped_line)
+            if header_match:
+                # If we have accumulated text, save the PREVIOUS chunk
+                if current_chunk_text:
+                    self._finalize_chunk(chunks, current_chunk_text, current_header, source_pdf, current_page)
+                    current_chunk_text = []
+                
+                # Update the header for the NEXT chunk
+                # We strip extra characters from the header title itself
+                current_header = header_match.group(2).strip()
+                continue
+
+            # Default: It's content. Append to buffer.
+            current_chunk_text.append(stripped_line)
+
+        # Catch the final chunk after the loop ends
+        if current_chunk_text:
+            self._finalize_chunk(chunks, current_chunk_text, current_header, source_pdf, current_page)
+
+        return chunks
+
+    def _clean_text(self, text_lines: List[str]) -> str:
+        """
+        Sanitizes text for better embedding quality.
+        """
+        # 1. Join lines with space to fix sentence breaks
+        full_text = " ".join(text_lines)
+        
+        # 2. Collapse multiple spaces/tabs into single space
+        full_text = self.whitespace_pattern.sub(' ', full_text)
+        
+        # 3. Remove common Markdown artifacts that don't help meaning
+        # (e.g., "**" bold markers, "==" highlights)
+        # We keep the text inside, just remove the symbols
+        full_text = full_text.replace("**", "").replace("__", "")
+        
+        # 4. Normalize quotes (optional, but good for consistency)
+        full_text = full_text.replace('"', '"').replace('"', '"')
+        
+        return full_text.strip()
+
+    def _finalize_chunk(self, chunk_list, text_lines, header, source, page):
+        """
+        Helper to construct the chunk dictionary and append it if valid.
+        """
+        # Run the cleaner
+        clean_content = self._clean_text(text_lines)
+        
+        # Filter 1: Noise Reduction (Too short)
+        if len(clean_content) < ChunkingConfig.MIN_CHUNK_LENGTH:
+            return
+
+        # Filter 2: Split Oversized Chunks
+        # If a chunk is massive, we can split it. 
+        # For now, we log it. In production, you might want to split strictly by tokens.
+        if len(clean_content) > ChunkingConfig.MAX_CHUNK_LENGTH:
+            logger.warning(f"Oversized chunk detected in {source}: {header} ({len(clean_content)} chars)")
+
+        chunk_obj = {
+            "id": str(uuid.uuid4()),
+            "source": source,
+            "page_start": page, # Renamed to page_start to be clearer
+            "topic": header,
+            "content": clean_content,
+            "length": len(clean_content),
+            "timestamp": datetime.now().isoformat()
+        }
+        chunk_list.append(chunk_obj)
+
+# --- 3. MAIN EXECUTION ---
+
+def build_knowledge_base():
+    if not ChunkingConfig.INPUT_DIR.exists():
+        logger.error(f"Input directory not found: {ChunkingConfig.INPUT_DIR}")
+        return
+
+    parser = NoteParser()
+    master_knowledge_base = []
+    
+    # Gather all text files
+    txt_files = list(ChunkingConfig.INPUT_DIR.glob("*.txt"))
+    logger.info(f"Found {len(txt_files)} documents to segregate.")
+
+    for txt_file in txt_files:
+        try:
+            file_chunks = parser.parse_file(txt_file)
+            master_knowledge_base.extend(file_chunks)
+            logger.info(f"Processed {txt_file.name}: {len(file_chunks)} chunks extracted.")
+        except Exception as e:
+            logger.error(f"Failed to parse {txt_file.name}: {e}")
+
+    # Output Statistics
+    if not master_knowledge_base:
+        logger.warning("No valid chunks were generated.")
+        return
+
+    logger.info(f"--- SEGMENTATION COMPLETE ---")
+    logger.info(f"Total Chunks Generated: {len(master_knowledge_base)}")
+    
+    # Save to JSON
+    try:
+        with open(ChunkingConfig.OUTPUT_FILE, 'w', encoding='utf-8') as f:
+            json.dump(master_knowledge_base, f, indent=2, ensure_ascii=False)
+        logger.info(f"Knowledge Base saved to: {ChunkingConfig.OUTPUT_FILE}")
+    except Exception as e:
+        logger.error(f"Failed to write JSON output: {e}")
+
+if __name__ == "__main__":
+    build_knowledge_base()
