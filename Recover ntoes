@@ -4,36 +4,85 @@ import time
 import csv
 import logging
 import re
+from collections import deque
 from datetime import datetime
 
 # Matplotlib for strict syntax auditing
-import matplotlib.pyplot as plt
-from matplotlib.mathtext import MathTextParser
+# (Ensure you have this installed: pip install matplotlib)
+try:
+    import matplotlib.pyplot as plt
+    from matplotlib.mathtext import MathTextParser
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
 
 from google import genai
 from google.genai import types
 
-# 1. Configuration
-API_KEY = os.getenv("GEMINI_API_KEY")
-TARGET_DIR = pathlib.Path(r"C:\College Notes DATA_BASE")
-OUTPUT_DIR = TARGET_DIR / "Transcribed_Text"
-QUARANTINE_DIR = OUTPUT_DIR / "_Review_Required"
-RECOVERY_LOG_PATH = TARGET_DIR / "recovery_audit.csv"
+# --- 1. CONFIGURATION & CONSTANTS (Synchronized) ---
 
-# Configure Logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s: %(message)s')
-logger = logging.getLogger(__name__)
+class IngestionConfig:
+    API_KEY = os.getenv("GEMINI_API_KEY")
+    BASE_DIR = pathlib.Path(r"C:\College Notes DATA_BASE")
+    OUTPUT_DIR = BASE_DIR / "Transcribed_Text"
+    QUARANTINE_DIR = OUTPUT_DIR / "_Review_Required"
+    RECOVERY_LOG_PATH = BASE_DIR / "recovery_audit.csv"
+    
+    MODEL_FAST = "gemini-2.5-flash" 
+    
+    # Rate Limiting
+    RPM_LIMIT = 5
+    RPM_PERIOD = 60
 
-if not API_KEY:
-    raise EnvironmentError("GEMINI_API_KEY is missing.")
+# Initialize Logging
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - [%(levelname)s] - %(message)s',
+    datefmt='%H:%M:%S'
+)
+logger = logging.getLogger("AcademicRemediator")
 
-client = genai.Client(api_key=API_KEY)
+if not IngestionConfig.API_KEY:
+    raise EnvironmentError("Critical: GEMINI_API_KEY environment variable is missing.")
 
-# --- STRICT VALIDATION ENGINE ---
+client = genai.Client(api_key=IngestionConfig.API_KEY)
+
+# --- 2. RATE LIMITER (Synchronized) ---
+
+class RateLimiter:
+    """
+    Shared rate limiter logic to prevent 429 errors during recovery.
+    """
+    def __init__(self, max_calls, period=60):
+        self.max_calls = max_calls
+        self.period = period
+        self.timestamps = deque()
+
+    def wait_for_slot(self):
+        now = time.time()
+        while self.timestamps and now - self.timestamps[0] > self.period:
+            self.timestamps.popleft()
+            
+        if len(self.timestamps) >= self.max_calls:
+            sleep_time = self.period - (now - self.timestamps[0])
+            if sleep_time > 0:
+                logger.info(f"Rate Limit Buffer: Pausing for {sleep_time:.2f}s...")
+                time.sleep(sleep_time + 0.1)
+            self.timestamps.popleft()
+            
+        self.timestamps.append(time.time())
+
+api_limiter = RateLimiter(max_calls=IngestionConfig.RPM_LIMIT, period=IngestionConfig.RPM_PERIOD)
+
+# --- 3. STRICT VALIDATION ENGINE ---
 
 class LaTeXValidator:
     def __init__(self):
-        self.parser = MathTextParser('path')
+        if MATPLOTLIB_AVAILABLE:
+            # We use the 'path' backend which is headless (no GUI required)
+            self.parser = MathTextParser('path')
+        else:
+            logger.warning("Matplotlib not found. Falling back to heuristic validation only.")
 
     def check_text_validity(self, text_content):
         """
@@ -41,10 +90,16 @@ class LaTeXValidator:
         Returns (False, Error_Message) if it fails.
         """
         # 1. Heuristic: Balanced Delimiters
-        if text_content.count("$") % 2 != 0:
+        # Remove escaped dollars first
+        clean_text = text_content.replace(r"\$", "")
+        if clean_text.count("$") % 2 != 0:
             return False, "Uneven LaTeX delimiters ($)"
 
+        if not MATPLOTLIB_AVAILABLE:
+            return True, "Valid (Heuristic Only)"
+
         # 2. Deep Parsing: Matplotlib
+        # This regex finds content between $...$ or $$...$$
         latex_pattern = re.compile(r'(\$\$?)(.+?)(\1)', re.DOTALL)
         matches = latex_pattern.findall(text_content)
 
@@ -59,16 +114,17 @@ class LaTeXValidator:
             except ValueError:
                 return False, f"Syntax Error: {clean_eq[:20]}..."
             except Exception as e:
-                return False, f"Render Error: {str(e)}"
+                # Catch generic parsing errors
+                return False, f"Render Error: {str(e)[:50]}"
         
         return True, "Valid"
 
-# --- AUDIT LOGGING ---
+# --- 4. AUDIT LOGGING ---
 
 def log_remediation(filename, method, status, notes=""):
-    file_exists = RECOVERY_LOG_PATH.exists()
+    file_exists = IngestionConfig.RECOVERY_LOG_PATH.exists()
     try:
-        with open(RECOVERY_LOG_PATH, "a", newline="", encoding="utf-8") as f:
+        with open(IngestionConfig.RECOVERY_LOG_PATH, "a", newline="", encoding="utf-8") as f:
             fields = ["timestamp", "file", "method", "status", "details"]
             writer = csv.DictWriter(f, fieldnames=fields)
             if not file_exists: writer.writeheader()
@@ -79,72 +135,20 @@ def log_remediation(filename, method, status, notes=""):
     except Exception as e:
         logger.error(f"Failed to write to audit log: {e}")
 
-# --- RECOVERY LOGIC ---
-
-def recover_quarantined_files():
-    quarantined_files = list(QUARANTINE_DIR.glob("*.txt"))
-    validator = LaTeXValidator()
-    
-    if not quarantined_files:
-        logger.info("No files found in quarantine. System clean.")
-        return
-
-    logger.info(f"Starting progressive recovery for {len(quarantined_files)} files...")
-
-    for txt_file in quarantined_files:
-        try:
-            pdf_name = txt_file.with_suffix(".pdf").name
-            pdf_path = TARGET_DIR / pdf_name
-            
-            if not pdf_path.exists():
-                logger.error(f"Source PDF missing for {txt_file.name}. Skipping.")
-                continue
-
-            with open(txt_file, "r", encoding="utf-8") as f:
-                current_text = f.read()
-
-            # 1. Pre-Check: If you manually fixed it, move it immediately.
-            is_valid, msg = validator.check_text_validity(current_text)
-            if is_valid:
-                logger.info(f"Manual fix verified for {txt_file.name}. Promoting...")
-                promote_file(txt_file)
-                continue
-
-            # 2. AI Remediation (Grammar + Syntax)
-            logger.info(f"Applying AI edits to {txt_file.name}...")
-            refined_text = run_remediation_audit(pdf_path, current_text)
-
-            # --- CRITICAL CHANGE: PROGRESSIVE SAVING ---
-            # We overwrite the quarantine file with the NEW text immediately.
-            # This ensures grammar fixes are saved even if math validation fails later.
-            with open(txt_file, "w", encoding="utf-8") as f:
-                f.write(refined_text)
-
-            # 3. Post-Audit Validation
-            is_valid_ai, msg_ai = validator.check_text_validity(refined_text)
-            
-            if is_valid_ai:
-                # If perfect, move to success folder
-                logger.info(f"SUCCESS: {txt_file.name} is now valid. Promoting.")
-                log_remediation(txt_file.name, "AI Repair", "Promoted", "All checks passed")
-                promote_file(txt_file)
-            else:
-                # If imperfect, leave it in quarantine (but now it has better grammar)
-                logger.warning(f"PARTIAL SUCCESS: {txt_file.name} updated with grammar fixes, but math failed: {msg_ai}")
-                log_remediation(txt_file.name, "AI Repair", "Updated (Still Quarantined)", f"Saved grammar fixes. Math error: {msg_ai}")
-
-        except Exception as e:
-            logger.error(f"Error processing {txt_file.name}: {e}")
+# --- 5. RECOVERY LOGIC ---
 
 def run_remediation_audit(pdf_path, draft_text):
     """
-    Revised Prompt: Explicitly handles the Table/Math confusion found in your logs.
+    Uses Gemini to fix the text. Includes Rate Limit Buffer.
     """
     myfile = None
     try:
+        # Upload does not consume generation quota, but we still handle it carefully
         myfile = client.files.upload(file=pdf_path)
         
+        start_time = time.time()
         while myfile.state == "PROCESSING":
+            if time.time() - start_time > 300: raise TimeoutError("Ingestion timeout")
             time.sleep(2)
             myfile = client.files.get(name=myfile.name)
             
@@ -159,8 +163,11 @@ def run_remediation_audit(pdf_path, draft_text):
             "Return the FULL corrected text."
         )
 
+        # BUFFER CHECK
+        api_limiter.wait_for_slot()
+
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model=IngestionConfig.MODEL_FAST,
             contents=[myfile, f"DRAFT:\n{draft_text}", audit_instruction],
             config=types.GenerateContentConfig(temperature=0.1) 
         )
@@ -173,11 +180,84 @@ def run_remediation_audit(pdf_path, draft_text):
             except: pass
 
 def promote_file(txt_file):
-    destination = OUTPUT_DIR / txt_file.name
+    """
+    Moves a valid file from Quarantine to the main Output directory.
+    """
+    destination = IngestionConfig.OUTPUT_DIR / txt_file.name
     try:
         if destination.exists(): os.remove(destination)
         txt_file.rename(destination)
+        logger.info(f"Promoted {txt_file.name} to Transcribed_Text.")
     except Exception as e:
         logger.error(f"Failed to move {txt_file.name}: {e}")
 
+def recover_quarantined_files():
+    # Ensure directories exist
+    if not IngestionConfig.QUARANTINE_DIR.exists():
+        logger.info("Quarantine directory does not exist. Nothing to recover.")
+        return
+
+    quarantined_files = list(IngestionConfig.QUARANTINE_DIR.glob("*.txt"))
+    validator = LaTeXValidator()
+    
+    if not quarantined_files:
+        logger.info("No files found in quarantine. System clean.")
+        return
+
+    logger.info(f"Starting progressive recovery for {len(quarantined_files)} files...")
+    logger.info(f"Rate Limiter Active: {IngestionConfig.RPM_LIMIT} calls per {IngestionConfig.RPM_PERIOD}s")
+
+    for txt_file in quarantined_files:
+        try:
+            # Locate source PDF in the Base Directory
+            pdf_name = txt_file.with_suffix(".pdf").name
+            pdf_path = IngestionConfig.BASE_DIR / pdf_name
+            
+            if not pdf_path.exists():
+                logger.error(f"Source PDF missing for {txt_file.name}. Skipping.")
+                continue
+
+            # Read current invalid text
+            with open(txt_file, "r", encoding="utf-8") as f:
+                current_text = f.read()
+
+            # 1. Pre-Check: If you manually fixed it, move it immediately.
+            is_valid, msg = validator.check_text_validity(current_text)
+            if is_valid:
+                logger.info(f"Manual fix verified for {txt_file.name}. Promoting...")
+                promote_file(txt_file)
+                continue
+
+            # 2. AI Remediation (Grammar + Syntax)
+            logger.info(f"Applying AI edits to {txt_file.name}...")
+            
+            try:
+                refined_text = run_remediation_audit(pdf_path, current_text)
+            except Exception as e:
+                logger.error(f"AI Generation failed for {txt_file.name}: {e}")
+                continue
+
+            # --- PROGRESSIVE SAVING ---
+            # Overwrite the quarantine file with the NEW text immediately.
+            # This ensures grammar fixes are saved even if math validation fails later.
+            with open(txt_file, "w", encoding="utf-8") as f:
+                f.write(refined_text)
+
+            # 3. Post-Audit Validation
+            is_valid_ai, msg_ai = validator.check_text_validity(refined_text)
+            
+            if is_valid_ai:
+                # If perfect, move to success folder
+                logger.info(f"SUCCESS: {txt_file.name} is now valid.")
+                log_remediation(txt_file.name, "AI Repair", "Promoted", "All checks passed")
+                promote_file(txt_file)
+            else:
+                # If imperfect, leave it in quarantine (but now it has better grammar)
+                logger.warning(f"PARTIAL: {txt_file.name} updated. Math error: {msg_ai}")
+                log_remediation(txt_file.name, "AI Repair", "Updated (Still Quarantined)", f"Saved grammar fixes. Math error: {msg_ai}")
+
+        except Exception as e:
+            logger.error(f"Error processing {txt_file.name}: {e}")
+
 if __name__ == "__main__":
+    recover_quarantined_files()
