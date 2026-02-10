@@ -5,249 +5,226 @@ import csv
 import logging
 import re
 from datetime import datetime
-
-# New imports for validation
-import matplotlib.pyplot as plt
-from matplotlib.mathtext import MathTextParser
-
 from google import genai
 from google.api_core import exceptions
 from google.genai import types
 
-# 1. Configuration & Global Constants
-API_KEY = os.getenv("GEMINI_API_KEY")
-TARGET_DIR = pathlib.Path(r"C:\College Notes DATA_BASE")
-OUTPUT_DIR = TARGET_DIR / "Transcribed_Text"
-FAILURE_LOG_PATH = TARGET_DIR / "conversion_failures.csv"
+# --- 1. CONFIGURATION & CONSTANTS ---
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s: %(message)s')
-logger = logging.getLogger(__name__)
+# Centralized configuration for easier maintenance
+class IngestionConfig:
+    API_KEY = os.getenv("GEMINI_API_KEY")
+    # Use raw strings for Windows paths to avoid escape character conflicts
+    BASE_DIR = pathlib.Path(r"C:\College Notes DATA_BASE")
+    OUTPUT_DIR = BASE_DIR / "Transcribed_Text"
+    QUARANTINE_DIR = OUTPUT_DIR / "_Review_Required"
+    LOG_PATH = BASE_DIR / "conversion_failures.csv"
+    
+    # Model definitions
+    MODEL_FAST = "gemini-2.5-flash" 
+    
+    # Generation parameters
+    TEMP_TRANSCRIPTION = 0.1
+    TEMP_AUDIT = 0.0
 
-if not API_KEY:
-    raise EnvironmentError("GEMINI_API_KEY environment variable is not configured.")
+# Initialize Logging
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - [%(levelname)s] - %(message)s',
+    datefmt='%H:%M:%S'
+)
+logger = logging.getLogger("AcademicArchivist")
 
-client = genai.Client(api_key=API_KEY)
+if not IngestionConfig.API_KEY:
+    raise EnvironmentError("Critical: GEMINI_API_KEY environment variable is missing.")
 
-# Ensure the output directory exists
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+client = genai.Client(api_key=IngestionConfig.API_KEY)
 
-# --- CORE PROCESSING LOGIC ---
+# --- 2. LOGGING & AUDIT TOOLS ---
 
-def process_document(pdf_path, output_path, thinking_budget=None):
+def log_failure(filename, stage, error_msg):
     """
-    Orchestrates high-fidelity transcription using a two-pass verification system.
+    Records operational failures to a persistent CSV ledger.
+    """
+    file_exists = IngestionConfig.LOG_PATH.exists()
+    try:
+        with open(IngestionConfig.LOG_PATH, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["timestamp", "file", "stage", "error"])
+            if not file_exists: 
+                writer.writeheader()
+            writer.writerow({
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "file": filename, 
+                "stage": stage, 
+                "error": str(error_msg)
+            })
+    except IOError as e:
+        logger.error(f"Failed to write to failure log: {e}")
+
+def validate_syntax(text_content):
+    """
+    Performs a heuristic audit of LaTeX delimiters.
+    
+    It filters out escaped dollars (e.g., \$) used for currency 
+    before calculating the parity of mathematical delimiters.
+    """
+    # Remove escaped dollars to prevent false positives (e.g., "\$50")
+    clean_text = text_content.replace(r"\$", "")
+    
+    # Count remaining dollars. In standard LaTeX, these should effectively appear in pairs.
+    # Note: This is a heuristic. It does not validate nested structures.
+    delimiter_count = clean_text.count("$")
+    
+    if delimiter_count % 2 != 0:
+        return False, f"Detected odd number of LaTeX delimiters ({delimiter_count})."
+    
+    return True, "Valid"
+
+# --- 3. CORE PROCESSING LOGIC ---
+
+def process_document(pdf_path, output_path):
+    """
+    Orchestrates the conversion of a PDF into a verified Markdown artifact.
+    
+    Phase 1: Ingestion & Transcription (Vision-to-Text)
+    Phase 2: Technical Audit (Text-to-Text Verification)
     """
     myfile = None
     try:
+        # Step A: Server-Side Ingestion
         myfile = client.files.upload(file=pdf_path)
-
-        # Await server-side processing
-        start = time.time()
+        
+        # Wait for file readiness
+        start_time = time.time()
         while myfile.state == "PROCESSING":
-            if time.time() - start > 300:
-                raise TimeoutError("Server ingestion timeout.")
-            time.sleep(5)
+            if time.time() - start_time > 300:
+                raise TimeoutError("Server ingestion timed out.")
+            time.sleep(2)
             myfile = client.files.get(name=myfile.name)
 
         if myfile.state == "FAILED":
-            raise ValueError("File failed server-side ingestion.")
+            raise ValueError("File failed internal server validation.")
 
-        # Pass 1: Standard Transcription
-        config = types.GenerateContentConfig(
-            temperature=0.1,
-            thinking_config=types.ThinkingConfig(thinking_budget=thinking_budget) if thinking_budget else None,
+        # Step B: Primary Transcription
+        # We instruct the model to act as a transcriptionist, not an interpreter.
+        transcription_prompt = (
+            "SYSTEM: You are an Academic Archivist specializing in paleography. "
+            "Your task is to transcribe these handwritten notes into clean Markdown. "
+            "Rules:\n"
+            "1. Transcribe text exactly as written. If a word is illegible, mark it as [?].\n"
+            "2. Convert all mathematical expressions into standard LaTeX notation (e.g., $E=mc^2$).\n"
+            "3. Do not summarize or explain the content. Literal transcription only.\n"
+            "4. Preserve the hierarchy of headers and bullet points."
+        )
+
+        config_transcribe = types.GenerateContentConfig(
+            temperature=IngestionConfig.TEMP_TRANSCRIPTION,
             max_output_tokens=8192
         )
 
-        instruction = (
-            "SYSTEM: Academic Archivist. Transcribe the multi-page PDF to Markdown. "
-            "Use LaTeX for all math. Enclose inline math in single $ and block math in $$. "
-            "Label pages clearly with '## Page X'. "
-            "Maintain all original headers and bullet points. Literal transcription only."
+        draft_response = client.models.generate_content(
+            model=IngestionConfig.MODEL_FAST,
+            contents=[myfile, transcription_prompt],
+            config=config_transcribe
         )
 
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[myfile, instruction],
-            config=config
+        if not draft_response.text:
+            raise ValueError("Model returned empty transcription.")
+
+        # Step C: The Audit Pass
+        # We treat the draft as a raw object that requires polishing.
+        audit_prompt = (
+            "TASK: Review the following transcription of academic notes for syntax errors. "
+            "Focus strictly on formatting:\n"
+            "1. Ensure all LaTeX delimiters are balanced.\n"
+            "2. Ensure tables use correct Markdown syntax.\n"
+            "3. Fix any obvious spelling errors derived from handwriting misinterpretation, "
+            "but only if the context makes the correction 100% certain.\n"
+            "4. Output the final cleaned text only."
         )
 
-        if not response.text:
-            raise ValueError("Empty response during transcription.")
-
-        # Pass 2: The Audit Pass (Strict Determinism for Math Syntax)
-        audit_instruction = (
-            "TASK: Conduct a technical audit of the transcription. "
-            "1. Check that all LaTeX equations are syntactically valid (balanced braces, valid commands). "
-            "2. Ensure inline math uses single $ and display math uses $$. "
-            "3. Correct any 'hallucinated' symbols that do not exist in standard LaTeX. "
-            "Return the final, corrected text in full."
-        )
-        
         verified_response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[myfile, f"DRAFT:\n{response.text}", audit_instruction],
-            config=types.GenerateContentConfig(temperature=0.0)
+            model=IngestionConfig.MODEL_FAST,
+            contents=[f"DRAFT:\n{draft_response.text}", audit_prompt],
+            config=types.GenerateContentConfig(temperature=IngestionConfig.TEMP_AUDIT)
         )
 
-        final_text = verified_response.text if verified_response.text else response.text
+        final_text = verified_response.text if verified_response.text else draft_response.text
 
-        # Atomic File Write
+        # Step D: Atomic Write & Post-Process Validation
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_path, "w", encoding="utf-8") as f:
+        
+        # Immediate syntax check before finalizing
+        is_valid, reason = validate_syntax(final_text)
+        
+        target_file = output_path
+        if not is_valid:
+            # Divert to quarantine immediately
+            IngestionConfig.QUARANTINE_DIR.mkdir(parents=True, exist_ok=True)
+            target_file = IngestionConfig.QUARANTINE_DIR / output_path.name
+            logger.warning(f"Quarantining {pdf_path.name}: {reason}")
+        
+        with open(target_file, "w", encoding="utf-8") as f:
             f.write(final_text)
 
         return True
 
     except Exception as e:
-        if not isinstance(e, exceptions.ResourceExhausted):
-            log_failure(pdf_path.name, "Processing", str(e))
-        raise e
+        # Log specific errors but allow the main loop to continue
+        log_failure(pdf_path.name, "Processing", str(e))
+        raise e # Re-raise to trigger the backoff logic in main
     finally:
+        # Cleanup: Remove the file from cloud storage to maintain hygiene
         if myfile:
-            try: client.files.delete(name=myfile.name)
-            except: pass
+            try:
+                client.files.delete(name=myfile.name)
+            except Exception:
+                pass
 
-# --- LOGGING & AUDIT TOOLS ---
-
-def log_failure(filename, stage, error_msg):
-    file_exists = FAILURE_LOG_PATH.exists()
-    with open(FAILURE_LOG_PATH, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["timestamp", "file", "stage", "error"])
-        if not file_exists: writer.writeheader()
-        writer.writerow({
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "file": filename, "stage": stage, "error": error_msg
-        })
-
-def generate_report():
-    all_pdfs = list(TARGET_DIR.glob("*.pdf"))
-    failed_files = set()
-    if FAILURE_LOG_PATH.exists():
-        with open(FAILURE_LOG_PATH, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            failed_files = {row['file'] for row in reader}
-
-    success_count = len(all_pdfs) - len(failed_files)
-    rate = (success_count / len(all_pdfs)) * 100 if all_pdfs else 0
-    
-    print(f"\n--- ACADEMIC BATCH AUDIT ---")
-    print(f"Total PDFs: {len(all_pdfs)} | Success: {success_count} | Failures: {len(failed_files)}")
-    print(f"Current Efficiency: {rate:.2f}%")
-    return failed_files
-
-# --- SYNTAX VALIDATION ENGINE ---
-
-class LaTeXValidator:
-    """
-    Uses Matplotlib's mathtext parser to strictly validate LaTeX strings.
-    If Matplotlib can't parse it, it's likely broken syntax.
-    """
-    def __init__(self):
-        # We use the 'path' backend which is lightweight for parsing checks
-        self.parser = MathTextParser('path')
-
-    def is_valid(self, latex_str):
-        try:
-            # Strip delimiters for the parser check
-            clean_str = latex_str.strip("$")
-            # Matplotlib requires a non-empty string to parse
-            if not clean_str.strip():
-                return True 
-            self.parser.parse(f"${clean_str}$")
-            return True
-        except ValueError:
-            return False
-        except Exception:
-            # Catch-all for other MPL rendering errors
-            return False
-
-def validate_and_quarantine(output_dir):
-    """
-    Scans output text files for invalid LaTeX syntax.
-    Moves defective files to a '_Review_Required' subdirectory.
-    """
-    review_dir = output_dir / "_Review_Required"
-    flagged_count = 0
-    validator = LaTeXValidator()
-    
-    # Regex to capture content between $...$ or $$...$$
-    # This pattern handles standard inline and display math
-    latex_pattern = re.compile(r'(\$\$?)(.+?)(\1)', re.DOTALL)
-    
-    txt_files = list(output_dir.glob("*.txt"))
-    
-    print(f"\n--- LATEX SYNTAX AUDIT (Powered by Matplotlib) ---")
-    
-    for txt_file in txt_files:
-        is_defective = False
-        try:
-            with open(txt_file, "r", encoding="utf-8") as f:
-                content = f.read()
-                
-            # 1. Basic Delimiter Check
-            if content.count("$") % 2 != 0:
-                print(f"[!] SYNTAX ERROR: Uneven delimiters in {txt_file.name}")
-                is_defective = True
-            
-            # 2. Deep Syntax Check via Matplotlib
-            else:
-                matches = latex_pattern.findall(content)
-                for _, equation, _ in matches:
-                    if not validator.is_valid(equation):
-                        print(f"[!] RENDER FAIL: Invalid LaTeX in {txt_file.name}: {equation[:30]}...")
-                        is_defective = True
-                        break # One error is enough to quarantine
-
-            if is_defective:
-                review_dir.mkdir(parents=True, exist_ok=True)
-                target_path = review_dir / txt_file.name
-                
-                # Move file
-                txt_file.rename(target_path)
-                flagged_count += 1
-                
-        except Exception as e:
-            logger.error(f"Validation failed for {txt_file.name}: {e}")
-
-    if flagged_count == 0:
-        print("Integrity Check Passed: All documents contain valid LaTeX.")
-    else:
-        print(f"Audit Complete: {flagged_count} files moved to {review_dir}")
-
-# --- MAIN EXECUTION ---
+# --- 4. EXECUTION CONTROLLER ---
 
 if __name__ == "__main__":
-    # Filter: Select PDFs only if their corresponding .txt does NOT exist in the OUTPUT_DIR
-    pdf_files = [
-        f for f in TARGET_DIR.glob("*.pdf") 
-        if not (OUTPUT_DIR / f.with_suffix(".txt").name).exists()
+    # Ensure directories exist
+    IngestionConfig.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Filter: Process only PDFs that do not have a corresponding .txt file
+    # This checks both the main output and the quarantine folder to avoid reprocessing bad files.
+    existing_stems = {
+        f.stem for f in IngestionConfig.OUTPUT_DIR.glob("*.txt")
+    } | {
+        f.stem for f in IngestionConfig.QUARANTINE_DIR.glob("*.txt")
+    }
+    
+    pdf_queue = [
+        p for p in IngestionConfig.BASE_DIR.glob("*.pdf") 
+        if p.stem not in existing_stems
     ]
     
-    logger.info(f"Found {len(pdf_files)} documents pending transcription.")
+    logger.info(f"Initialization Complete. Pending Documents: {len(pdf_queue)}")
 
-    for pdf in pdf_files:
-        output_txt = OUTPUT_DIR / pdf.with_suffix(".txt").name
+    for pdf in pdf_queue:
+        output_txt = IngestionConfig.OUTPUT_DIR / f"{pdf.stem}.txt"
         
-        attempts = 0
+        # Exponential Backoff Strategy
+        # We allow up to 3 attempts with increasing delays to handle rate limits.
         max_attempts = 3
-        while attempts < max_attempts:
+        for attempt in range(max_attempts):
             try:
+                logger.info(f"Processing: {pdf.name} (Attempt {attempt + 1})")
                 process_document(pdf, output_txt)
-                logger.info(f"Success: {pdf.name} -> {output_txt}")
+                logger.info(f"Success: {pdf.name}")
+                
+                # Rate limiting buffer (essential for batch processing)
                 time.sleep(2) 
                 break
+                
             except exceptions.ResourceExhausted:
-                wait = (2 ** attempts) * 60 
-                logger.warning(f"Rate limited on {pdf.name}. Sleeping {wait}s...")
-                time.sleep(wait)
-                attempts += 1
+                wait_time = (2 ** attempt) * 60
+                logger.warning(f"Rate Limit Hit. Pausing for {wait_time} seconds...")
+                time.sleep(wait_time)
+                
             except Exception as e:
-                logger.error(f"Critical fail on {pdf.name}: {e}")
-                break
+                logger.error(f"Critical Failure on {pdf.name}: {e}")
+                break # Move to next file on non-retryable error
 
-    # Final Audit
-    failures = generate_report()
-    
-    # Syntax Integrity & Quarantine
-    validate_and_quarantine(OUTPUT_DIR)
+    logger.info("Batch Processing Complete.")
