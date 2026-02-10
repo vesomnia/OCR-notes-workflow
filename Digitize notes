@@ -4,6 +4,7 @@ import os
 import csv
 import logging
 import re
+from collections import deque  # Added for the buffer
 from datetime import datetime
 from google import genai
 from google.api_core import exceptions
@@ -27,6 +28,10 @@ class IngestionConfig:
     TEMP_TRANSCRIPTION = 0.1
     TEMP_AUDIT = 0.0
 
+    # Rate Limiting (Free Tier Buffer)
+    RPM_LIMIT = 5   # Max requests per minute
+    RPM_PERIOD = 60 # Time window in seconds
+
 # Initialize Logging
 logging.basicConfig(
     level=logging.INFO, 
@@ -40,7 +45,47 @@ if not IngestionConfig.API_KEY:
 
 client = genai.Client(api_key=IngestionConfig.API_KEY)
 
-# --- 2. LOGGING & AUDIT TOOLS ---
+# --- 2. RATE LIMITER (THE BUFFER) ---
+
+class RateLimiter:
+    """
+    A sliding window rate limiter to prevent API 429 errors.
+    It tracks the timestamps of the last N requests and sleeps
+    if the limit is about to be exceeded.
+    """
+    def __init__(self, max_calls, period=60):
+        self.max_calls = max_calls
+        self.period = period
+        self.timestamps = deque()
+
+    def wait_for_slot(self):
+        """
+        Blocks execution until a slot is available in the sliding window.
+        """
+        now = time.time()
+        
+        # Remove timestamps older than the period window
+        while self.timestamps and now - self.timestamps[0] > self.period:
+            self.timestamps.popleft()
+            
+        # If we have reached the limit, calculate sleep time
+        if len(self.timestamps) >= self.max_calls:
+            # How long until the oldest request expires?
+            sleep_time = self.period - (now - self.timestamps[0])
+            if sleep_time > 0:
+                logger.info(f"Rate Limit Buffer: Pausing for {sleep_time:.2f}s...")
+                time.sleep(sleep_time + 0.1) # Add tiny buffer to be safe
+            
+            # Clean up the deque again after sleeping
+            self.timestamps.popleft()
+            
+        # Record the current request
+        self.timestamps.append(time.time())
+
+# Initialize the global limiter
+api_limiter = RateLimiter(max_calls=IngestionConfig.RPM_LIMIT, period=IngestionConfig.RPM_PERIOD)
+
+# --- 3. LOGGING & AUDIT TOOLS ---
 
 def log_failure(filename, stage, error_msg):
     """
@@ -72,7 +117,6 @@ def validate_syntax(text_content):
     clean_text = text_content.replace(r"\$", "")
     
     # Count remaining dollars. In standard LaTeX, these should effectively appear in pairs.
-    # Note: This is a heuristic. It does not validate nested structures.
     delimiter_count = clean_text.count("$")
     
     if delimiter_count % 2 != 0:
@@ -80,7 +124,7 @@ def validate_syntax(text_content):
     
     return True, "Valid"
 
-# --- 3. CORE PROCESSING LOGIC ---
+# --- 4. CORE PROCESSING LOGIC ---
 
 def process_document(pdf_path, output_path):
     """
@@ -106,7 +150,6 @@ def process_document(pdf_path, output_path):
             raise ValueError("File failed internal server validation.")
 
         # Step B: Primary Transcription
-        # We instruct the model to act as a transcriptionist, not an interpreter.
         transcription_prompt = (
             "SYSTEM: You are an Academic Archivist specializing in paleography. "
             "Your task is to transcribe these handwritten notes into clean Markdown. "
@@ -122,6 +165,9 @@ def process_document(pdf_path, output_path):
             max_output_tokens=8192
         )
 
+        # --- BUFFER CHECK INSERTED HERE ---
+        api_limiter.wait_for_slot()
+        
         draft_response = client.models.generate_content(
             model=IngestionConfig.MODEL_FAST,
             contents=[myfile, transcription_prompt],
@@ -132,7 +178,6 @@ def process_document(pdf_path, output_path):
             raise ValueError("Model returned empty transcription.")
 
         # Step C: The Audit Pass
-        # We treat the draft as a raw object that requires polishing.
         audit_prompt = (
             "TASK: Review the following transcription of academic notes for syntax errors. "
             "Focus strictly on formatting:\n"
@@ -142,6 +187,9 @@ def process_document(pdf_path, output_path):
             "but only if the context makes the correction 100% certain.\n"
             "4. Output the final cleaned text only."
         )
+
+        # --- BUFFER CHECK INSERTED HERE ---
+        api_limiter.wait_for_slot()
 
         verified_response = client.models.generate_content(
             model=IngestionConfig.MODEL_FAST,
@@ -181,14 +229,13 @@ def process_document(pdf_path, output_path):
             except Exception:
                 pass
 
-# --- 4. EXECUTION CONTROLLER ---
+# --- 5. EXECUTION CONTROLLER ---
 
 if __name__ == "__main__":
     # Ensure directories exist
     IngestionConfig.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     # Filter: Process only PDFs that do not have a corresponding .txt file
-    # This checks both the main output and the quarantine folder to avoid reprocessing bad files.
     existing_stems = {
         f.stem for f in IngestionConfig.OUTPUT_DIR.glob("*.txt")
     } | {
@@ -201,12 +248,12 @@ if __name__ == "__main__":
     ]
     
     logger.info(f"Initialization Complete. Pending Documents: {len(pdf_queue)}")
+    logger.info(f"Rate Limiter Enabled: {IngestionConfig.RPM_LIMIT} requests per {IngestionConfig.RPM_PERIOD} seconds.")
 
     for pdf in pdf_queue:
         output_txt = IngestionConfig.OUTPUT_DIR / f"{pdf.stem}.txt"
         
         # Exponential Backoff Strategy
-        # We allow up to 3 attempts with increasing delays to handle rate limits.
         max_attempts = 3
         for attempt in range(max_attempts):
             try:
@@ -214,13 +261,14 @@ if __name__ == "__main__":
                 process_document(pdf, output_txt)
                 logger.info(f"Success: {pdf.name}")
                 
-                # Rate limiting buffer (essential for batch processing)
-                time.sleep(2) 
+                # Small operational pause (distinct from the API buffer)
+                time.sleep(1) 
                 break
                 
             except exceptions.ResourceExhausted:
+                # If we hit the limit despite the buffer, we perform a hard sleep
                 wait_time = (2 ** attempt) * 60
-                logger.warning(f"Rate Limit Hit. Pausing for {wait_time} seconds...")
+                logger.warning(f"Rate Limit Hit (External). Pausing for {wait_time} seconds...")
                 time.sleep(wait_time)
                 
             except Exception as e:
