@@ -19,7 +19,7 @@ except ImportError:
 from google import genai
 from google.genai import types
 
-# --- 1. CONFIGURATION & CONSTANTS (Synchronized) ---
+# --- 1. CONFIGURATION & CONSTANTS ---
 
 class IngestionConfig:
     API_KEY = os.getenv("GEMINI_API_KEY")
@@ -47,7 +47,7 @@ if not IngestionConfig.API_KEY:
 
 client = genai.Client(api_key=IngestionConfig.API_KEY)
 
-# --- 2. RATE LIMITER (Synchronized) ---
+# --- 2. RATE LIMITER ---
 
 class RateLimiter:
     """
@@ -239,7 +239,6 @@ def recover_quarantined_files():
 
             # --- PROGRESSIVE SAVING ---
             # Overwrite the quarantine file with the NEW text immediately.
-            # This ensures grammar fixes are saved even if math validation fails later.
             with open(txt_file, "w", encoding="utf-8") as f:
                 f.write(refined_text)
 
@@ -247,12 +246,10 @@ def recover_quarantined_files():
             is_valid_ai, msg_ai = validator.check_text_validity(refined_text)
             
             if is_valid_ai:
-                # If perfect, move to success folder
                 logger.info(f"SUCCESS: {txt_file.name} is now valid.")
                 log_remediation(txt_file.name, "AI Repair", "Promoted", "All checks passed")
                 promote_file(txt_file)
             else:
-                # If imperfect, leave it in quarantine (but now it has better grammar)
                 logger.warning(f"PARTIAL: {txt_file.name} updated. Math error: {msg_ai}")
                 log_remediation(txt_file.name, "AI Repair", "Updated (Still Quarantined)", f"Saved grammar fixes. Math error: {msg_ai}")
 
