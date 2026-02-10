@@ -125,6 +125,7 @@ def validate_syntax(text_content):
 def process_document(pdf_path, output_path):
     """
     Orchestrates the conversion of a PDF into a verified Markdown artifact.
+    Modified to split processing into 5-page chunks to avoid output token limits.
     """
     myfile = None
     try:
@@ -142,61 +143,81 @@ def process_document(pdf_path, output_path):
         if myfile.state == "FAILED":
             raise ValueError("File failed internal server validation.")
 
-        # Step B: Primary Transcription
-        transcription_prompt = (
-            "SYSTEM: You are an Academic Archivist specializing in paleography. "
-            "Your task is to transcribe these handwritten notes into clean Markdown. "
-            "Rules:\n"
-            "1. Transcribe text exactly as written. If a word is illegible, mark it as [?].\n"
-            "2. Convert all mathematical expressions into standard LaTeX notation (e.g., $E=mc^2$).\n"
-            "3. Do not summarize or explain the content. Literal transcription only.\n"
-            "4. Preserve the hierarchy of headers and bullet points."
-        )
+        # --- PAGINATION LOOP ---
+        full_document_text = ""
+        batch_size = 5
+        # Estimate max pages (safe upper limit, loop will break early if needed)
+        max_estimated_pages = 35 
 
-        config_transcribe = types.GenerateContentConfig(
-            temperature=IngestionConfig.TEMP_TRANSCRIPTION,
-            max_output_tokens=8192
-        )
+        for batch_start in range(1, max_estimated_pages + 1, batch_size):
+            batch_end = batch_start + batch_size - 1
+            logger.info(f"  -> Processing batch: Pages {batch_start} to {batch_end}...")
 
-        # --- BUFFER CHECK INSERTED HERE ---
-        api_limiter.wait_for_slot()
-        
-        draft_response = client.models.generate_content(
-            model=IngestionConfig.MODEL_FAST,
-            contents=[myfile, transcription_prompt],
-            config=config_transcribe
-        )
+            # Step B: Primary Transcription (Paginated)
+            transcription_prompt = (
+                f"SYSTEM: You are an Academic Archivist specializing in paleography. "
+                f"TASK: Transcribe ONLY pages {batch_start} to {batch_end} of this document. "
+                "If these pages do not exist (end of document), output exactly 'END_OF_DOCUMENT'.\n"
+                "Rules:\n"
+                "1. Transcribe text exactly as written. If a word is illegible, mark it as [?].\n"
+                "2. Convert all mathematical expressions into standard LaTeX notation (e.g., $E=mc^2$).\n"
+                "3. Do not summarize or explain the content. Literal transcription only.\n"
+                "4. Preserve the hierarchy of headers and bullet points."
+            )
 
-        if not draft_response.text:
-            raise ValueError("Model returned empty transcription.")
+            config_transcribe = types.GenerateContentConfig(
+                temperature=IngestionConfig.TEMP_TRANSCRIPTION,
+                max_output_tokens=8192
+            )
 
-        # Step C: The Audit Pass
-        audit_prompt = (
-            "TASK: Review the following transcription of academic notes for syntax errors. "
-            "Focus strictly on formatting:\n"
-            "1. Ensure all LaTeX delimiters are balanced.\n"
-            "2. Ensure tables use correct Markdown syntax.\n"
-            "3. Fix any obvious spelling errors derived from handwriting misinterpretation, "
-            "but only if the context makes the correction 100% certain.\n"
-            "4. Output the final cleaned text only."
-        )
+            # --- BUFFER CHECK 1 ---
+            api_limiter.wait_for_slot()
+            
+            draft_response = client.models.generate_content(
+                model=IngestionConfig.MODEL_FAST,
+                contents=[myfile, transcription_prompt],
+                config=config_transcribe
+            )
 
-        # --- BUFFER CHECK INSERTED HERE ---
-        api_limiter.wait_for_slot()
+            chunk_text = draft_response.text if draft_response.text else ""
 
-        verified_response = client.models.generate_content(
-            model=IngestionConfig.MODEL_FAST,
-            contents=[f"DRAFT:\n{draft_response.text}", audit_prompt],
-            config=types.GenerateContentConfig(temperature=IngestionConfig.TEMP_AUDIT)
-        )
+            # Check for termination signal
+            if "END_OF_DOCUMENT" in chunk_text or not chunk_text.strip():
+                logger.info("  -> End of document detected.")
+                break
 
-        final_text = verified_response.text if verified_response.text else draft_response.text
+            # Step C: The Audit Pass (Chunk Level)
+            audit_prompt = (
+                "TASK: Review the following transcription chunk for syntax errors. "
+                "Focus strictly on formatting:\n"
+                "1. Ensure all LaTeX delimiters are balanced.\n"
+                "2. Ensure tables use correct Markdown syntax.\n"
+                "3. Fix any obvious spelling errors derived from handwriting misinterpretation.\n"
+                "4. Output the final cleaned text only."
+            )
+
+            # --- BUFFER CHECK 2 ---
+            api_limiter.wait_for_slot()
+
+            verified_response = client.models.generate_content(
+                model=IngestionConfig.MODEL_FAST,
+                contents=[f"DRAFT_CHUNK:\n{chunk_text}", audit_prompt],
+                config=types.GenerateContentConfig(temperature=IngestionConfig.TEMP_AUDIT)
+            )
+
+            final_chunk = verified_response.text if verified_response.text else chunk_text
+            
+            # Stitching: Add to full text with a separator
+            full_document_text += f"\n\n{final_chunk}"
 
         # Step D: Atomic Write & Post-Process Validation
+        if not full_document_text.strip():
+             raise ValueError("No text extracted from document.")
+
         output_path.parent.mkdir(parents=True, exist_ok=True)
         
-        # Immediate syntax check before finalizing
-        is_valid, reason = validate_syntax(final_text)
+        # Immediate syntax check on the FULL stitched document
+        is_valid, reason = validate_syntax(full_document_text)
         
         target_file = output_path
         if not is_valid:
@@ -206,7 +227,7 @@ def process_document(pdf_path, output_path):
             logger.warning(f"Quarantining {pdf_path.name}: {reason}")
         
         with open(target_file, "w", encoding="utf-8") as f:
-            f.write(final_text)
+            f.write(full_document_text)
 
         return True
 
@@ -254,7 +275,7 @@ if __name__ == "__main__":
                 process_document(pdf, output_txt)
                 logger.info(f"Success: {pdf.name}")
                 
-                # Small operational pause (distinct from the API buffer)
+                # Small operational pause
                 time.sleep(1) 
                 break
                 
